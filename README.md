@@ -1,9 +1,13 @@
 # grocery_deals
 
 A single-file Python module that fetches real-time weekly-ad sale data from
-**Kroger** (official Products API) and **Publix** (via Flipp's public backend,
-where Publix officially publishes its weekly ad). Designed to be wired up as a
-tool for an LLM agent.
+**Kroger** and **Publix** via [Flipp](https://backflipp.wishabi.com/) — the
+backend where both retailers officially publish their flyers. Designed to be
+wired up as a tool for an LLM agent.
+
+One network fetch per `(ZIP, merchant)`, cached 6 hours. Repeated calls with
+different keywords against the same store share that cached fetch — the
+keyword filter is applied in Python.
 
 ## Install
 
@@ -11,19 +15,8 @@ tool for an LLM agent.
 python3 -m pip install -r requirements.txt
 ```
 
-Python 3.10+. The only runtime dependency is `requests`.
-
-## Credentials
-
-Kroger uses OAuth2 client-credentials. Get a free key at
-<https://developer.kroger.com> and export:
-
-```bash
-export KROGER_CLIENT_ID=...
-export KROGER_CLIENT_SECRET=...
-```
-
-Publix needs no credentials.
+Python 3.10+. The only runtime dependency is `requests`. No credentials, no
+env vars.
 
 ## Python API
 
@@ -32,23 +25,21 @@ from grocery_deals import (
     Deal,
     get_publix_deals,
     get_kroger_deals,
-    find_kroger_location,
     search_across,
 )
 
-# Resolve a ZIP to a Kroger locationId
-locs = find_kroger_location("45202")
-loc_id = locs[0]["location_id"]
+# All items in this week's Kroger flyer for ZIP 45202
+kroger = get_kroger_deals("45202")
 
-kroger_deals = get_kroger_deals(loc_id, "milk", only_on_sale=True)
-publix_deals = get_publix_deals("33486", query="chicken")
+# Filter to milk — no extra network call, served from the same cached flyer
+milk = get_kroger_deals("45202", "milk")
 
-# Cross-retailer search
-both = search_across(
-    "chicken",
-    kroger_location_id=loc_id,
-    publix_zip="33486",
-)
+# Publix BOGOs
+publix = get_publix_deals("33486")
+bogos = [d for d in publix if d.promo_type == "bogo"]
+
+# Both retailers, one ZIP, one query
+both = search_across("chicken", zip_code="33486")
 
 for d in both:
     print(d.to_dict())
@@ -66,26 +57,32 @@ image_url, source_id
 
 `Deal.to_dict()` returns a JSON-serializable dict.
 
+### Function signatures
+
+```python
+get_publix_deals(zip_code, query=None, *, only_on_sale=False, hydrate=False)
+get_kroger_deals(zip_code, query=None, *, only_on_sale=False, hydrate=False)
+search_across(query, *, zip_code, only_on_sale=True)
+```
+
+`hydrate=True` issues a per-item detail fetch for each result to pick up
+precise regular-price and valid-from/valid-to fields.
+
 ## CLI
 
 ```bash
-python -m grocery_deals find-kroger --zip 45202
-python -m grocery_deals kroger --location-id 01400376 --query milk
-python -m grocery_deals publix --zip 33486 --query chicken --bogo-only
-python -m grocery_deals search --query bread \
-    --kroger-location-id 01400376 --publix-zip 33486 --json
+python -m grocery_deals kroger --zip 45202 --query milk
+python -m grocery_deals publix --zip 33486 --bogo-only
+python -m grocery_deals search --zip 33486 --query bread --json
 ```
 
-Add `--json` to any subcommand for machine-readable output.
+Add `--json` to any subcommand for machine-readable output. `--on-sale`
+drops items without an identifiable promo.
 
 ## Caching
 
-Responses are cached to `~/.cache/grocery_deals/`:
-
-- Publix: 6h (flyer cycles Wed/Thu)
-- Kroger: 30 min
-
-Delete the directory to force-refresh.
+Responses are cached to `~/.cache/grocery_deals/` with a 6h TTL (flyers
+cycle Wed/Thu). Delete the directory to force-refresh.
 
 ## Tests
 

@@ -1,4 +1,9 @@
-"""Fetch real-time weekly-ad sale data from Kroger and Publix.
+"""Fetch real-time weekly-ad sale data from Kroger and Publix via Flipp.
+
+Both retailers officially publish their weekly ads through Flipp
+(``backflipp.wishabi.com``). We fetch the full flyer once per (ZIP, merchant)
+and apply keyword filtering client-side, so repeated queries for the same
+store share a single network call (cached 6h).
 
 Designed to be used as a tool by an LLM agent. See README.md and CLAUDE.md
 for usage details and architectural constraints.
@@ -14,7 +19,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,28 +31,24 @@ __all__ = [
     "Deal",
     "get_publix_deals",
     "get_kroger_deals",
-    "find_kroger_location",
     "search_across",
 ]
 
 log = logging.getLogger("grocery_deals")
 
-KROGER_API = "https://api.kroger.com/v1"
-KROGER_TOKEN_URL = f"{KROGER_API}/connect/oauth2/token"
-KROGER_PRODUCTS_URL = f"{KROGER_API}/products"
-KROGER_LOCATIONS_URL = f"{KROGER_API}/locations"
-
 FLIPP_SEARCH_URL = "https://backflipp.wishabi.com/flipp/items/search"
 FLIPP_ITEM_URL = "https://backflipp.wishabi.com/flipp/items/{item_id}"
 
-PUBLIX_MERCHANT = "publix"
+# Merchant tokens are lowercased substrings matched against the Flipp
+# ``merchant`` / ``merchant_name`` field. Keep flexible — Flipp's merchant
+# strings can read as "Publix", "PUBLIX SUPER MARKETS", "Kroger", etc.
+MERCHANT_PUBLIX = "publix"
+MERCHANT_KROGER = "kroger"
 
 CACHE_DIR = Path(os.path.expanduser("~/.cache/grocery_deals"))
-PUBLIX_TTL = 6 * 60 * 60          # 6 hours
-KROGER_TTL = 30 * 60              # 30 minutes
-TOKEN_REFRESH_SKEW = 60           # refresh 60s before expiry
+FLYER_TTL = 6 * 60 * 60      # 6 hours — flyers cycle Wed/Thu
 
-USER_AGENT = "grocery_deals/0.1 (+https://github.com/kevinold/grocery_deals)"
+USER_AGENT = "grocery_deals/0.2 (+https://github.com/kevinold/grocery_deals)"
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +86,7 @@ def _session() -> requests.Session:
         total=4,
         backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "POST"),
+        allowed_methods=("GET",),
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -160,7 +161,7 @@ def classify_promo(*texts: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Publix (via Flipp public backend)
+# Flipp shared helpers
 # ---------------------------------------------------------------------------
 
 def _flipp_get(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -191,7 +192,21 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
-def _parse_flipp_item(item: dict[str, Any]) -> Deal:
+def _merchant_of(item: dict[str, Any]) -> str:
+    return (_first(item, "merchant", "merchant_name", default="") or "").lower()
+
+
+def _merchant_matches(item: dict[str, Any], token: str) -> bool:
+    return token in _merchant_of(item)
+
+
+def _display_retailer(token: str) -> str:
+    return {MERCHANT_PUBLIX: "Publix", MERCHANT_KROGER: "Kroger"}.get(
+        token, token.title()
+    )
+
+
+def _parse_flipp_item(item: dict[str, Any], retailer: str) -> Deal:
     """Map a Flipp item dict to a Deal.
 
     NOTE: Flipp renames fields periodically. Keep all existing fallback keys
@@ -217,7 +232,7 @@ def _parse_flipp_item(item: dict[str, Any]) -> Deal:
             savings = diff
 
     return Deal(
-        retailer="Publix",
+        retailer=retailer,
         store_id=str(_first(item, "merchant_id", "store_id", default="") or "") or None,
         product_name=str(_first(item, "name", "title", "display_name", default="")),
         brand=_first(item, "brand", "manufacturer"),
@@ -234,53 +249,36 @@ def _parse_flipp_item(item: dict[str, Any]) -> Deal:
     )
 
 
-def _is_publix(item: dict[str, Any]) -> bool:
-    merchant = (_first(item, "merchant", "merchant_name", default="") or "").lower()
-    return PUBLIX_MERCHANT in merchant
+def _keyword_matches(deal: Deal, query: str) -> bool:
+    q = query.lower()
+    for field in (deal.product_name, deal.brand, deal.size, deal.promo_text):
+        if field and q in field.lower():
+            return True
+    return False
 
 
-def get_publix_deals(
-    zip_code: str,
-    query: str | None = None,
-    *,
-    hydrate: bool = False,
-) -> list[Deal]:
-    """Fetch Publix weekly-ad deals via the Flipp public backend.
+def _fetch_flyer(zip_code: str, merchant_token: str) -> list[dict[str, Any]]:
+    """Fetch the full flyer for a merchant at a ZIP, cached 6h.
 
-    Args:
-        zip_code: 5-digit ZIP code used to localize the flyer.
-        query: Optional keyword filter; when omitted the full Publix flyer is
-            returned (q="publix").
-        hydrate: When True, fetch per-item detail for each result to populate
-            precise regular_price and valid_from/valid_to fields.
+    We always request ``q=<merchant>`` so repeated calls for different keywords
+    against the same store share a single cache entry and a single network
+    fetch.
     """
-    if not zip_code or not zip_code.strip():
-        raise ValueError("zip_code is required")
-
-    q = query.strip() if query else "publix"
-    params = {"locale": "en-us", "postal_code": zip_code, "q": q}
-    cache_path = _cache_key("publix_search", params)
-
-    payload = _cache_get(cache_path, PUBLIX_TTL)
+    params = {"locale": "en-us", "postal_code": zip_code, "q": merchant_token}
+    cache_path = _cache_key(f"flyer_{merchant_token}", params)
+    payload = _cache_get(cache_path, FLYER_TTL)
     if payload is None:
         payload = _flipp_get(FLIPP_SEARCH_URL, params=params)
         _cache_put(cache_path, payload)
-
     items = payload.get("items") or payload.get("results") or []
-    publix_items = [it for it in items if _is_publix(it)]
-
-    deals = [_parse_flipp_item(it) for it in publix_items]
-
-    if hydrate:
-        deals = [_hydrate_publix_deal(d) for d in deals]
-    return deals
+    return [it for it in items if _merchant_matches(it, merchant_token)]
 
 
-def _hydrate_publix_deal(deal: Deal) -> Deal:
+def _hydrate_deal(deal: Deal, retailer: str) -> Deal:
     if not deal.source_id:
         return deal
-    cache_path = _cache_key("publix_item", {"id": deal.source_id})
-    payload = _cache_get(cache_path, PUBLIX_TTL)
+    cache_path = _cache_key("flipp_item", {"id": deal.source_id})
+    payload = _cache_get(cache_path, FLYER_TTL)
     if payload is None:
         try:
             payload = _flipp_get(FLIPP_ITEM_URL.format(item_id=deal.source_id))
@@ -289,231 +287,97 @@ def _hydrate_publix_deal(deal: Deal) -> Deal:
             log.warning("hydrate failed for %s: %s", deal.source_id, exc)
             return deal
     item = payload.get("item") or payload
-    return _parse_flipp_item(item)
+    return _parse_flipp_item(item, retailer)
 
 
-# ---------------------------------------------------------------------------
-# Kroger (official Products API)
-# ---------------------------------------------------------------------------
-
-class _KrogerToken:
-    def __init__(self) -> None:
-        self.access_token: str | None = None
-        self.expires_at: float = 0.0
-
-    def valid(self) -> bool:
-        return bool(self.access_token) and time.time() < (self.expires_at - TOKEN_REFRESH_SKEW)
-
-
-_KROGER_TOKEN = _KrogerToken()
-
-
-def _kroger_credentials() -> tuple[str, str]:
-    cid = os.environ.get("KROGER_CLIENT_ID")
-    sec = os.environ.get("KROGER_CLIENT_SECRET")
-    if not cid or not sec:
-        raise RuntimeError(
-            "KROGER_CLIENT_ID and KROGER_CLIENT_SECRET env vars are required "
-            "(free signup at https://developer.kroger.com)"
-        )
-    return cid, sec
-
-
-def _kroger_token() -> str:
-    if _KROGER_TOKEN.valid():
-        return _KROGER_TOKEN.access_token  # type: ignore[return-value]
-    cid, sec = _kroger_credentials()
-    r = _HTTP.post(
-        KROGER_TOKEN_URL,
-        auth=(cid, sec),
-        data={"grant_type": "client_credentials", "scope": "product.compact"},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    body = r.json()
-    _KROGER_TOKEN.access_token = body["access_token"]
-    _KROGER_TOKEN.expires_at = time.time() + float(body.get("expires_in", 1800))
-    return _KROGER_TOKEN.access_token  # type: ignore[return-value]
-
-
-def _kroger_get(url: str, params: dict[str, Any]) -> dict[str, Any]:
-    token = _kroger_token()
-    r = _HTTP.get(
-        url,
-        params=params,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=20,
-    )
-    if r.status_code == 401:
-        # Force refresh and retry once
-        _KROGER_TOKEN.access_token = None
-        token = _kroger_token()
-        r = _HTTP.get(
-            url,
-            params=params,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=20,
-        )
-    r.raise_for_status()
-    return r.json()
-
-
-def find_kroger_location(zip_code: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Translate a ZIP code into one or more Kroger locationId values."""
+def _deals_for(
+    zip_code: str,
+    merchant_token: str,
+    query: str | None,
+    *,
+    only_on_sale: bool,
+    hydrate: bool,
+) -> list[Deal]:
     if not zip_code or not zip_code.strip():
         raise ValueError("zip_code is required")
-    params = {"filter.zipCode.near": zip_code, "filter.limit": limit}
-    cache_path = _cache_key("kroger_loc", params)
-    payload = _cache_get(cache_path, KROGER_TTL)
-    if payload is None:
-        payload = _kroger_get(KROGER_LOCATIONS_URL, params=params)
-        _cache_put(cache_path, payload)
 
-    out: list[dict[str, Any]] = []
-    for loc in payload.get("data", []):
-        addr = loc.get("address", {}) or {}
-        out.append({
-            "location_id": loc.get("locationId"),
-            "name": loc.get("name"),
-            "chain": loc.get("chain"),
-            "address": addr.get("addressLine1"),
-            "city": addr.get("city"),
-            "state": addr.get("state"),
-            "zip": addr.get("zipCode"),
-        })
-    return out
+    retailer = _display_retailer(merchant_token)
+    items = _fetch_flyer(zip_code, merchant_token)
+    deals = [_parse_flipp_item(it, retailer) for it in items]
 
+    if query and query.strip():
+        q = query.strip()
+        deals = [d for d in deals if _keyword_matches(d, q)]
 
-def _normalize_kroger_promo(price: dict[str, Any]) -> float | None:
-    promo = price.get("promo")
-    if promo in (None, 0, 0.0, "0", "0.0"):
-        return None
-    try:
-        return float(promo)
-    except (TypeError, ValueError):
-        return None
+    if only_on_sale:
+        deals = [d for d in deals if d.sale_price is not None or d.promo_type != "sale"]
 
-
-def _parse_kroger_product(prod: dict[str, Any], location_id: str) -> Deal | None:
-    items = prod.get("items") or []
-    if not items:
-        return None
-    item = items[0]
-    price = item.get("price") or {}
-    regular = _to_float(price.get("regular"))
-    sale = _normalize_kroger_promo(price)
-
-    savings = None
-    if regular is not None and sale is not None:
-        diff = round(regular - sale, 2)
-        if diff > 0:
-            savings = diff
-
-    if sale is not None:
-        promo_type = "sale"
-        promo_text = f"On sale at ${sale:.2f}"
-    else:
-        promo_type = "sale"
-        promo_text = None
-
-    images = prod.get("images") or []
-    image_url = None
-    for img in images:
-        for size in img.get("sizes") or []:
-            if size.get("url"):
-                image_url = size["url"]
-                break
-        if image_url:
-            break
-
-    return Deal(
-        retailer="Kroger",
-        store_id=location_id,
-        product_name=prod.get("description") or "",
-        brand=prod.get("brand"),
-        size=item.get("size"),
-        regular_price=regular,
-        sale_price=sale,
-        savings=savings,
-        promo_type=promo_type,
-        promo_text=promo_text,
-        valid_from=None,
-        valid_to=None,
-        image_url=image_url,
-        source_id=prod.get("productId"),
-    )
-
-
-def get_kroger_deals(
-    location_id: str,
-    query: str,
-    *,
-    only_on_sale: bool = True,
-    limit: int = 50,
-) -> list[Deal]:
-    """Fetch Kroger products for a query at a given store location."""
-    if not location_id or not location_id.strip():
-        raise ValueError("location_id is required")
-    if not query or not query.strip():
-        raise ValueError("query is required")
-    limit = max(1, min(int(limit), 50))
-
-    params = {
-        "filter.term": query,
-        "filter.locationId": location_id,
-        "filter.limit": limit,
-    }
-    cache_path = _cache_key("kroger_prod", params)
-    payload = _cache_get(cache_path, KROGER_TTL)
-    if payload is None:
-        payload = _kroger_get(KROGER_PRODUCTS_URL, params=params)
-        _cache_put(cache_path, payload)
-
-    deals: list[Deal] = []
-    for prod in payload.get("data", []):
-        deal = _parse_kroger_product(prod, location_id)
-        if deal is None:
-            continue
-        if only_on_sale and deal.sale_price is None:
-            continue
-        deals.append(deal)
+    if hydrate:
+        deals = [_hydrate_deal(d, retailer) for d in deals]
     return deals
 
 
 # ---------------------------------------------------------------------------
-# Cross-retailer search
+# Public API
 # ---------------------------------------------------------------------------
+
+def get_publix_deals(
+    zip_code: str,
+    query: str | None = None,
+    *,
+    only_on_sale: bool = False,
+    hydrate: bool = False,
+) -> list[Deal]:
+    """Fetch Publix weekly-ad deals via Flipp.
+
+    A single network fetch per (zip_code) is shared across all keyword calls
+    in the 6-hour cache window — filtering is applied client-side.
+    """
+    return _deals_for(
+        zip_code, MERCHANT_PUBLIX, query,
+        only_on_sale=only_on_sale, hydrate=hydrate,
+    )
+
+
+def get_kroger_deals(
+    zip_code: str,
+    query: str | None = None,
+    *,
+    only_on_sale: bool = False,
+    hydrate: bool = False,
+) -> list[Deal]:
+    """Fetch Kroger weekly-ad deals via Flipp.
+
+    A single network fetch per (zip_code) is shared across all keyword calls
+    in the 6-hour cache window — filtering is applied client-side.
+    """
+    return _deals_for(
+        zip_code, MERCHANT_KROGER, query,
+        only_on_sale=only_on_sale, hydrate=hydrate,
+    )
+
 
 def search_across(
     query: str,
     *,
-    kroger_location_id: str | None,
-    publix_zip: str | None,
+    zip_code: str,
     only_on_sale: bool = True,
 ) -> list[Deal]:
-    """Run the same query against Kroger and Publix and return combined deals."""
+    """Run the same query against Kroger and Publix for a single ZIP."""
     if not query or not query.strip():
         raise ValueError("query is required")
+    if not zip_code or not zip_code.strip():
+        raise ValueError("zip_code is required")
+
     deals: list[Deal] = []
-    if kroger_location_id:
+    for token in (MERCHANT_KROGER, MERCHANT_PUBLIX):
         try:
-            deals.extend(get_kroger_deals(
-                kroger_location_id, query, only_on_sale=only_on_sale
+            deals.extend(_deals_for(
+                zip_code, token, query,
+                only_on_sale=only_on_sale, hydrate=False,
             ))
         except Exception as exc:  # noqa: BLE001 - surface partial results
-            log.warning("kroger fetch failed: %s", exc)
-    if publix_zip:
-        try:
-            publix_deals = get_publix_deals(publix_zip, query=query)
-            if only_on_sale:
-                publix_deals = [
-                    d for d in publix_deals
-                    if d.sale_price is not None or d.promo_type != "sale"
-                ]
-            deals.extend(publix_deals)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("publix fetch failed: %s", exc)
+            log.warning("%s fetch failed: %s", token, exc)
     return deals
 
 
@@ -557,53 +421,39 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--query", default=None)
     sp.add_argument("--hydrate", action="store_true")
     sp.add_argument("--bogo-only", action="store_true")
+    sp.add_argument("--on-sale", action="store_true",
+                    help="drop items with no identifiable promo/sale price")
 
-    sk = sub.add_parser("kroger", help="fetch Kroger products")
-    sk.add_argument("--location-id", required=True)
-    sk.add_argument("--query", required=True)
-    sk.add_argument("--limit", type=int, default=50)
-    sk.add_argument("--all", action="store_true", help="include items not on sale")
+    sk = sub.add_parser("kroger", help="fetch Kroger deals via Flipp")
+    sk.add_argument("--zip", required=True, dest="zip_code")
+    sk.add_argument("--query", default=None)
+    sk.add_argument("--hydrate", action="store_true")
+    sk.add_argument("--bogo-only", action="store_true")
+    sk.add_argument("--on-sale", action="store_true")
 
-    sf = sub.add_parser("find-kroger", help="resolve ZIP to Kroger locationId")
-    sf.add_argument("--zip", required=True, dest="zip_code")
-    sf.add_argument("--limit", type=int, default=5)
-
-    ss = sub.add_parser("search", help="cross-retailer search")
+    ss = sub.add_parser("search", help="cross-retailer search at a single ZIP")
+    ss.add_argument("--zip", required=True, dest="zip_code")
     ss.add_argument("--query", required=True)
-    ss.add_argument("--kroger-location-id", default=None)
-    ss.add_argument("--publix-zip", default=None)
-    ss.add_argument("--all", action="store_true", help="include items not on sale")
+    ss.add_argument("--all", action="store_true",
+                    help="include items without an identifiable promo")
 
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    if args.cmd == "publix":
-        deals = get_publix_deals(args.zip_code, args.query, hydrate=args.hydrate)
+    if args.cmd in ("publix", "kroger"):
+        fn = get_publix_deals if args.cmd == "publix" else get_kroger_deals
+        deals = fn(
+            args.zip_code, args.query,
+            only_on_sale=args.on_sale, hydrate=args.hydrate,
+        )
         if args.bogo_only:
             deals = [d for d in deals if d.promo_type == "bogo"]
         _emit(deals, args.json)
-    elif args.cmd == "kroger":
-        deals = get_kroger_deals(
-            args.location_id, args.query,
-            only_on_sale=not args.all, limit=args.limit,
-        )
-        _emit(deals, args.json)
-    elif args.cmd == "find-kroger":
-        locs = find_kroger_location(args.zip_code, args.limit)
-        if args.json:
-            print(json.dumps(locs, indent=2))
-        else:
-            for loc in locs:
-                print(f"{loc['location_id']}  {loc['name']}  "
-                      f"{loc['address']}, {loc['city']}, {loc['state']} {loc['zip']}")
     elif args.cmd == "search":
         deals = search_across(
-            args.query,
-            kroger_location_id=args.kroger_location_id,
-            publix_zip=args.publix_zip,
-            only_on_sale=not args.all,
+            args.query, zip_code=args.zip_code, only_on_sale=not args.all,
         )
         _emit(deals, args.json)
     else:  # pragma: no cover - argparse enforces required subcommand
