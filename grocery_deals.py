@@ -1,3 +1,11 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "requests>=2.31",
+# ]
+# ///
+
 """Fetch real-time weekly-ad sale data from Kroger and Publix via Flipp.
 
 Both retailers officially publish their weekly ads through Flipp

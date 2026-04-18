@@ -11,8 +11,20 @@ keyword filter is applied in Python.
 
 ## Install
 
+The script declares its dependencies inline (PEP 723), so with
+[`uv`](https://docs.astral.sh/uv/) no separate install step is needed —
+`uv` provisions an ephemeral environment on first run and caches it:
+
 ```bash
-python3 -m pip install -r requirements.txt
+./grocery_deals.py kroger --zip 45202 --query milk
+# or, equivalently:
+uv run grocery_deals.py kroger --zip 45202 --query milk
+```
+
+To import it as a library, install the runtime dep into your own env:
+
+```bash
+uv pip install -r requirements.txt   # or: python3 -m pip install -r requirements.txt
 ```
 
 Python 3.10+. The only runtime dependency is `requests`. No credentials, no
@@ -71,8 +83,15 @@ precise regular-price and valid-from/valid-to fields.
 ## CLI
 
 ```bash
-python -m grocery_deals kroger --zip 45202 --query milk
-python -m grocery_deals publix --zip 33486 --bogo-only
+./grocery_deals.py kroger --zip 45202 --query milk
+./grocery_deals.py publix --zip 33486 --bogo-only
+./grocery_deals.py search --zip 33486 --query bread --json
+```
+
+Or via `uv run` / `python -m` if preferred:
+
+```bash
+uv run grocery_deals.py kroger --zip 45202 --query milk
 python -m grocery_deals search --zip 33486 --query bread --json
 ```
 
@@ -87,8 +106,9 @@ cycle Wed/Thu). Delete the directory to force-refresh.
 ## Tests
 
 ```bash
-python3 -m pip install pytest
-pytest -q
+uv run --with pytest --with requests pytest -q
+# or, classically:
+python3 -m pip install pytest requests && pytest -q
 ```
 
 Tests are network-free.
