@@ -8,6 +8,10 @@ A single-file Python module (`grocery_deals.py`) that fetches weekly-ad sale
 data from **Kroger and Publix via Flipp** and normalizes it into a uniform
 `Deal` schema. It is meant to be called as a tool by an LLM agent.
 
+A thin sibling script `grocery_deals_mcp.py` wraps the public API as an
+MCP server (FastMCP over stdio) for clients like zeroclaw. The wrapper
+has its own inline deps (`mcp`); the core module must not import `mcp`.
+
 ## Architecture, in one paragraph
 
 Both retailers publish their weekly ads through Flipp
@@ -35,7 +39,8 @@ retailer at a given ZIP.
    region variants still use them.
 5. **Do not break the public API surface.** `Deal`, `get_publix_deals`,
    `get_kroger_deals`, `search_across` are exported in `__all__` and consumed
-   by agent tool definitions.
+   by agent tool definitions *and* by `grocery_deals_mcp.py`. Changing a
+   signature here means updating the MCP tool wrapper too.
 6. **Do not add a Kroger OAuth / Products-API path back.** The project was
    originally dual-sourced (Kroger official API + Publix via Flipp) and was
    intentionally consolidated onto Flipp for uniform caching, fewer

@@ -98,6 +98,57 @@ python -m grocery_deals search --zip 33486 --query bread --json
 Add `--json` to any subcommand for machine-readable output. `--on-sale`
 drops items without an identifiable promo.
 
+## MCP server
+
+`grocery_deals_mcp.py` exposes the public API as [Model Context
+Protocol](https://modelcontextprotocol.io/) tools over stdio, so an
+agent (zeroclaw, Claude Desktop, etc.) can call them. It's a separate
+uv-inline script — the core module stays `requests`-only.
+
+Tools exposed:
+
+- `publix_deals(zip_code, query=None, only_on_sale=False, hydrate=False)`
+- `kroger_deals(zip_code, query=None, only_on_sale=False, hydrate=False)`
+- `search_deals(query, zip_code, only_on_sale=True)`
+
+Each returns a list of `Deal` dicts (same shape as `Deal.to_dict()`).
+
+Inspect it locally with the MCP dev UI:
+
+```bash
+uv run --with "mcp[cli]" mcp dev ./grocery_deals_mcp.py
+```
+
+### Register with zeroclaw
+
+Add to `~/.zeroclaw/config.toml`:
+
+```toml
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "grocery_deals"
+transport = "stdio"
+command = "/Users/kevinold/projects/grocery_deals/grocery_deals_mcp.py"
+args = []
+tool_timeout_secs = 30
+```
+
+The shebang (`#!/usr/bin/env -S uv run --script`) lets zeroclaw launch
+the script directly; uv provisions the ephemeral env on first run and
+caches it. If your launchd environment doesn't see `uv` on `PATH`, use
+an absolute `uv` path instead:
+
+```toml
+command = "/opt/homebrew/bin/uv"
+args = ["run", "--script", "/Users/kevinold/projects/grocery_deals/grocery_deals_mcp.py"]
+```
+
+Restart the daemon, then ask the agent something like *"use grocery_deals
+to find chicken deals at 45202"* — the LLM will see
+`grocery_deals__search_deals` and friends as callable tools.
+
 ## Caching
 
 Responses are cached to `~/.cache/grocery_deals/` with a 6h TTL (flyers

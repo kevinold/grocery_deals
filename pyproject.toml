@@ -1,0 +1,15 @@
+[project]
+name = "grocery-deals"
+version = "0.1.0"
+description = "Fetch real-time weekly-ad sale data from Kroger and Publix via Flipp. CLI + MCP server."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "mcp>=1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+]
